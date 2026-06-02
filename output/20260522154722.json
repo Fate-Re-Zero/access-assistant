@@ -1,0 +1,6 @@
+{
+  "hand_code": "MERCHANT_AUTH_PARAMS_INSUFFICIENT",
+  "hand_message": "当前无法确定调用的是哪个参数，无法精准定位到问题。请补充请求参数、错误响应（可选，建议补充完整响应）、所属业务（可选）和请求 IP（可选），我继续帮你定位问题。",
+  "hand_time": "2026-05-22 15:47:22",
+  "hand_trace_id": "9960e57b-ab46-4fc3-8421-cf550e27751b"
+}

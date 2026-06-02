@@ -1,0 +1,6 @@
+{
+  "hand_code": "SIGNATURE_INFO_INSUFFICIENT",
+  "hand_message": "当前信息不足以准确判断签名错误原因。请补充调用参数、签名原串、签名结果、错误响应以及接口名称，我再继续帮你定位。",
+  "hand_time": "2026-05-13 15:31:40",
+  "hand_trace_id": "91b250f8-4963-497e-bdd6-d817b99a86be"
+}

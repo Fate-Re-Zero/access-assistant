@@ -1,0 +1,6 @@
+{
+  "hand_code": "MERCHANT_AUTH_INFO_INSUFFICIENT",
+  "hand_message": "当前缺少商户名称，无法精准判断是否为授权问题。请补充商户名称、调用接口、请求参数、错误响应和请求 IP，我再继续帮你定位。",
+  "hand_time": "2026-05-13 16:23:33",
+  "hand_trace_id": "b8c7c303-c08e-492b-a714-dab317f779e1"
+}
