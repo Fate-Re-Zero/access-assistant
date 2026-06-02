@@ -62,6 +62,7 @@ def _normalize_provider(provider: str | None) -> str | None:
         "claude": "anthropic",
         "openai": "openai",
         "gpt": "openai",
+        "deepseek": "openai",
     }
     return aliases.get(normalized, normalized)
 
@@ -109,13 +110,18 @@ def _infer_provider_from_model_name(model: str | None) -> str | None:
 
     model_name = model.strip().lower()
     anthropic_prefixes = ("claude-",)
-    openai_prefixes = ("gpt-", "o1", "o3", "o4", "chatgpt-")
+    openai_prefixes = ("gpt-", "o1", "o3", "o4", "chatgpt-", "deepseek-")
 
     if model_name.startswith(anthropic_prefixes):
         return "anthropic"
     if model_name.startswith(openai_prefixes):
         return "openai"
     return None
+
+
+def _is_deepseek_model_name(model: str | None) -> bool:
+    """判断当前模型是否为 DeepSeek 系列模型。"""
+    return bool(model and model.strip().lower().startswith("deepseek-"))
 
 
 def _resolve_requested_provider(model: str | None = None, model_provider: str | None = None) -> str:
@@ -128,6 +134,7 @@ def _resolve_requested_provider(model: str | None = None, model_provider: str | 
         generic_env_provider
         or _infer_provider_from_model_name(generic_env_model)
         or ("openai" if os.getenv("OPENAI_MODEL") else None)
+        or ("openai" if os.getenv("DEEPSEEK_MODEL") else None)
         or ("anthropic" if os.getenv("ANTHROPIC_MODEL") or os.getenv("CLAUDE_MODEL") else None)
     )
 
@@ -163,7 +170,11 @@ def _resolve_model_name(provider: str, requested_model: str | None = None) -> st
         return stripped_generic_model
 
     if provider == "openai":
-        return os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+        return (
+            os.getenv("OPENAI_MODEL")
+            or os.getenv("DEEPSEEK_MODEL")
+            or DEFAULT_OPENAI_MODEL
+        )
 
     return (
         os.getenv("ANTHROPIC_MODEL")
@@ -193,10 +204,16 @@ def _get_provider_credentials(provider: str) -> tuple[str | None, str | None]:
             api_key
             or os.getenv("OPENAI_API_KEY")
             or os.getenv("OPENAI_AUTH_TOKEN")
+            or os.getenv("DEEPSEEK_API_KEY")
+            or os.getenv("DEEPSEEK_AUTH_TOKEN")
             or os.getenv("ANTHROPIC_AUTH_TOKEN")
             or os.getenv("ANTHROPIC_API_KEY")
         )
-        base_url = base_url or os.getenv("OPENAI_BASE_URL")
+        base_url = (
+            base_url
+            or os.getenv("OPENAI_BASE_URL")
+            or os.getenv("DEEPSEEK_BASE_URL")
+        )
     else:
         api_key = (
             api_key
@@ -336,7 +353,11 @@ When a user request matches a skill's description, use the load_skill tool to ge
                 "budget_tokens": self.thinking_budget,
             }
         elif self.model_provider == "openai" and self.enable_thinking:
-            use_responses_api = _parse_bool_env("OPENAI_USE_RESPONSES_API", True)
+            default_use_responses_api = not _is_deepseek_model_name(self.model_name)
+            use_responses_api = _parse_bool_env(
+                "OPENAI_USE_RESPONSES_API",
+                default_use_responses_api,
+            )
             reasoning_effort = (
                 os.getenv("OPENAI_REASONING_EFFORT")
                 or os.getenv("MODEL_REASONING_EFFORT")

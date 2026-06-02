@@ -1,6 +1,6 @@
-# Skills Agent Web UI
+# Access Assistant Web UI
 
-React + TypeScript chat UI for the LangChain Skills Agent.
+React + TypeScript chat UI for the Access Assistant Agent.
 
 ## Development
 

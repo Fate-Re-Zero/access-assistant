@@ -77,7 +77,7 @@ def create_app(agent_provider: Callable[[], AgentLike] | None = None) -> FastAPI
     provider = agent_provider or _default_agent_provider
 
     app = FastAPI(
-        title="LangChain Skills Agent Web API",
+        title="Access Assistant Agent Web API",
         version="0.1.0",
         description="SSE bridge for stream_events()",
     )
