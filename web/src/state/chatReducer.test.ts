@@ -359,4 +359,151 @@ describe("chatReducer", () => {
     expect(assistant.error).toContain("SSE closed unexpectedly");
     expect(failed.isStreaming).toBe(false);
   });
+
+  it("creates sub-agent run on tool_call when agent_call was missed", () => {
+    const submitted = chatReducer(createInitialState(), {
+      type: "submit_user_message",
+      threadId: "thread-1",
+      message: "auth issue",
+      userEntryId: "user-1",
+      assistantEntryId: "assistant-1",
+      createdAt: 1,
+    });
+
+    const withToolCall = chatReducer(submitted, {
+      type: "stream_event",
+      threadId: "thread-1",
+      assistantEntryId: "assistant-1",
+      event: {
+        type: "tool_call",
+        id: "call-1",
+        name: "auth-mcp-server_sqg_query_account_info",
+        args: { inputAccount: "123" },
+        agent: "auth",
+        agent_name: "auth",
+        agent_run_id: "thread-1-auth_1",
+        task_title: "账号排查",
+      },
+    });
+
+    const assistant = withToolCall.threads["thread-1"].timeline[1];
+    expect(assistant.kind).toBe("assistant");
+    if (assistant.kind !== "assistant") return;
+
+    expect(assistant.subAgents).toHaveLength(1);
+    expect(assistant.subAgents[0].agentName).toBe("auth");
+    expect(assistant.subAgents[0].tools).toHaveLength(1);
+    expect(assistant.subAgents[0].tools[0].name).toBe("auth-mcp-server_sqg_query_account_info");
+  });
+
+  it("keeps sub-agent tools when agent_call updates an existing run", () => {
+    let state = chatReducer(createInitialState(), {
+      type: "submit_user_message",
+      threadId: "thread-1",
+      message: "auth issue",
+      userEntryId: "user-1",
+      assistantEntryId: "assistant-1",
+      createdAt: 1,
+    });
+
+    state = chatReducer(state, {
+      type: "stream_event",
+      threadId: "thread-1",
+      assistantEntryId: "assistant-1",
+      event: {
+        type: "agent_call",
+        id: "thread-1-auth_1",
+        agent_name: "auth",
+        title: "认证助手",
+      },
+    });
+
+    state = chatReducer(state, {
+      type: "stream_event",
+      threadId: "thread-1",
+      assistantEntryId: "assistant-1",
+      event: {
+        type: "tool_call",
+        id: "call-1",
+        name: "auth-mcp-server_sqg_query_account_info",
+        args: { inputAccount: "123" },
+        agent: "auth",
+        agent_run_id: "thread-1-auth_1",
+      },
+    });
+
+    state = chatReducer(state, {
+      type: "stream_event",
+      threadId: "thread-1",
+      assistantEntryId: "assistant-1",
+      event: {
+        type: "agent_call",
+        id: "thread-1-auth_1",
+        agent_name: "auth",
+        title: "认证助手",
+      },
+    });
+
+    const assistant = state.threads["thread-1"].timeline[1];
+    expect(assistant.kind).toBe("assistant");
+    if (assistant.kind !== "assistant") return;
+    expect(assistant.subAgents[0].tools).toHaveLength(1);
+  });
+
+  it("tracks supervisor auth tool flow end-to-end", () => {
+    let state = chatReducer(createInitialState(), {
+      type: "submit_user_message",
+      threadId: "thread-1",
+      message: "auth issue",
+      userEntryId: "user-1",
+      assistantEntryId: "assistant-1",
+      createdAt: 1,
+    });
+
+    const events = [
+      { type: "thinking" as const, content: "[task plan] auth", agent: "supervisor" },
+      {
+        type: "agent_call" as const,
+        id: "thread-1-auth_1",
+        agent_name: "auth",
+        title: "认证助手",
+      },
+      {
+        type: "tool_call" as const,
+        id: "call-1",
+        name: "auth-mcp-server_sqg_query_account_info",
+        args: { inputAccount: "123" },
+        agent: "auth",
+        agent_run_id: "thread-1-auth_1",
+      },
+      {
+        type: "tool_result" as const,
+        name: "auth-mcp-server_sqg_query_account_info",
+        content: "[OK] account info",
+        success: true,
+        agent: "auth",
+        agent_run_id: "thread-1-auth_1",
+      },
+      { type: "done" as const, response: "final" },
+    ];
+
+    for (const event of events) {
+      state = chatReducer(state, {
+        type: "stream_event",
+        threadId: "thread-1",
+        assistantEntryId: "assistant-1",
+        event,
+      });
+    }
+
+    const assistant = state.threads["thread-1"].timeline[1];
+    expect(assistant.kind).toBe("assistant");
+    if (assistant.kind !== "assistant") return;
+    expect(assistant.subAgents).toHaveLength(1);
+    expect(assistant.subAgents[0].tools).toHaveLength(1);
+    expect(assistant.subAgents[0].tools[0].status).toBe("success");
+    expect(assistant.subAgents[0].tools[0].name).toBe(
+      "auth-mcp-server_sqg_query_account_info",
+    );
+  });
 });

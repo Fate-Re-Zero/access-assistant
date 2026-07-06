@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 
 import { ChatTimeline } from "./components/ChatTimeline";
 import { Composer } from "./components/Composer";
-import { SkillPanel } from "./components/SkillPanel";
+import { ConversationSidebar } from "./components/ConversationSidebar";
+import { WelcomePanel } from "./components/WelcomePanel";
 import { openChatStream } from "./lib/sse";
 import {
   chatReducer,
@@ -14,6 +15,7 @@ import "./App.css";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL?.trim() || "http://localhost:8000";
+  // import.meta.env.VITE_API_BASE_URL?.trim() || "https://access-assistant.u.sdo.com";
 
 function makeId(prefix: string): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -41,11 +43,30 @@ function promptAsMarkdown(prompt: string): string {
   return `## System Prompt\n\n\`\`\`text\n${escaped}\n\`\`\``;
 }
 
+const STREAM_PRIORITY_EVENTS = new Set([
+  "tool_call",
+  "tool_result",
+  "agent_call",
+  "agent_done",
+  "agent_error",
+  "done",
+  "error",
+]);
+
 export default function App() {
   const [state, dispatch] = useReducer(chatReducer, undefined, createInitialState);
   const streamCloserRef = useRef<(() => void) | null>(null);
+  const streamBatchRef = useRef<{
+    threadId: string;
+    assistantEntryId: string;
+    pending: Map<string, AgentStreamEvent>;
+    frameId: number | null;
+  } | null>(null);
+  const [composerDraft, setComposerDraft] = useState<string | undefined>(undefined);
 
   const activeThread = state.threads[state.activeThreadId];
+  const timeline = activeThread?.timeline ?? [];
+  const isEmpty = timeline.length === 0;
 
   useEffect(() => {
     let cancelled = false;
@@ -80,18 +101,6 @@ export default function App() {
       streamCloserRef.current?.();
     };
   }, []);
-
-  const threadOptions = useMemo(
-    () =>
-      state.threadOrder.map((threadId) => {
-        const thread = state.threads[threadId];
-        return {
-          value: threadId,
-          label: thread?.label || threadId,
-        };
-      }),
-    [state.threadOrder, state.threads],
-  );
 
   const appendSystemMessage = (content: string, markdown = true) => {
     dispatch({
@@ -144,23 +153,89 @@ export default function App() {
     });
 
     streamCloserRef.current?.();
+    streamBatchRef.current = {
+      threadId,
+      assistantEntryId,
+      pending: new Map(),
+      frameId: null,
+    };
+
+    const flushStreamBatch = () => {
+      const batch = streamBatchRef.current;
+      if (!batch) {
+        return;
+      }
+      batch.frameId = null;
+      for (const event of batch.pending.values()) {
+        dispatch({
+          type: "stream_event",
+          threadId: batch.threadId,
+          assistantEntryId: batch.assistantEntryId,
+          event,
+        });
+      }
+      batch.pending.clear();
+    };
+
+    const scheduleStreamBatchFlush = () => {
+      const batch = streamBatchRef.current;
+      if (!batch || batch.frameId !== null) {
+        return;
+      }
+      batch.frameId = requestAnimationFrame(flushStreamBatch);
+    };
+
     streamCloserRef.current = openChatStream({
       apiBaseUrl: API_BASE_URL,
       message: text,
       threadId,
       onEvent: (event: AgentStreamEvent) => {
+        const batch = streamBatchRef.current;
+        if (!batch) {
+          return;
+        }
+
+        if (STREAM_PRIORITY_EVENTS.has(event.type)) {
+          flushStreamBatch();
+          dispatch({
+            type: "stream_event",
+            threadId: batch.threadId,
+            assistantEntryId: batch.assistantEntryId,
+            event,
+          });
+          if (event.type === "done" || event.type === "error") {
+            streamBatchRef.current = null;
+            streamCloserRef.current = null;
+          }
+          return;
+        }
+
+        if (event.type === "text" || event.type === "thinking") {
+          const key = `${event.type}:${event.agent ?? "supervisor"}:${event.agent_run_id ?? ""}`;
+          const previous = batch.pending.get(key);
+          if (previous && (previous.type === "text" || previous.type === "thinking")) {
+            batch.pending.set(key, {
+              ...previous,
+              content: `${previous.content}${event.content}`,
+            });
+          } else {
+            batch.pending.set(key, event);
+          }
+          scheduleStreamBatchFlush();
+          return;
+        }
+
+        flushStreamBatch();
         dispatch({
           type: "stream_event",
-          threadId,
-          assistantEntryId,
+          threadId: batch.threadId,
+          assistantEntryId: batch.assistantEntryId,
           event,
         });
-
-        if (event.type === "done" || event.type === "error") {
-          streamCloserRef.current = null;
-        }
       },
       onError: (message) => {
+        flushStreamBatch();
+        streamBatchRef.current = null;
         dispatch({
           type: "stream_failed",
           threadId,
@@ -193,62 +268,57 @@ export default function App() {
     dispatch({
       type: "create_thread",
       threadId,
-      label: `Thread ${threadNumber}`,
+      label: "新对话",
     });
   };
 
+  const handleSelectThread = useCallback(
+    (threadId: string) => {
+      dispatch({ type: "switch_thread", threadId });
+    },
+    [],
+  );
+
+  const handlePromptSelect = useCallback((text: string) => {
+    setComposerDraft(text);
+  }, []);
+
+  const clearComposerDraft = useCallback(() => {
+    setComposerDraft(undefined);
+  }, []);
+
   return (
-    <div className="app-shell">
-      <header className="top-bar">
-        <div className="brand">
-          <p className="eyebrow">Payment Agent</p>
-          <h1>Web Console</h1>
+    <div className="app-layout">
+      <ConversationSidebar
+        threadOrder={state.threadOrder}
+        threads={state.threads}
+        activeThreadId={state.activeThreadId}
+        disabled={state.isStreaming}
+        onNewThread={createThread}
+        onSelectThread={handleSelectThread}
+      />
+
+      <main className="main-panel">
+        <div className="main-content">
+          {isEmpty ? (
+            <WelcomePanel onPromptSelect={handlePromptSelect} />
+          ) : (
+            <ChatTimeline
+              entries={timeline}
+              onToggleToolExpand={handleToggleToolExpand}
+            />
+          )}
         </div>
 
-        <div className="thread-controls">
-          <label htmlFor="thread-select">Thread</label>
-          <select
-            id="thread-select"
-            value={state.activeThreadId}
-            disabled={state.isStreaming}
-            onChange={(event) =>
-              dispatch({
-                type: "switch_thread",
-                threadId: event.target.value,
-              })
-            }
-          >
-            {threadOptions.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-          <button type="button" disabled={state.isStreaming} onClick={createThread}>
-            New Thread
-          </button>
-        </div>
-      </header>
+        {state.streamError && <p className="global-error">{state.streamError}</p>}
 
-      <div className="workspace">
-        <SkillPanel
-          skills={state.skills}
-          activeSkillName={activeThread?.activeSkillName}
-          loading={!state.skillsLoaded && !state.skillsError}
-          error={state.skillsError}
+        <Composer
+          disabled={state.isStreaming}
+          draft={composerDraft}
+          onDraftApplied={clearComposerDraft}
+          onSubmit={handleSend}
         />
-
-        <main className="chat-panel">
-          <ChatTimeline
-            entries={activeThread?.timeline || []}
-            onToggleToolExpand={handleToggleToolExpand}
-          />
-
-          {state.streamError && <p className="global-error">{state.streamError}</p>}
-
-          <Composer disabled={state.isStreaming} onSubmit={handleSend} />
-        </main>
-      </div>
+      </main>
     </div>
   );
 }

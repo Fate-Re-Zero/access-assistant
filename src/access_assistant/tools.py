@@ -11,14 +11,25 @@ ToolRuntime 提供访问运行时信息的统一接口：
 - context: 不可变的配置（如 skill_loader）
 """
 
+import locale
+import os
 import subprocess
 import fnmatch
 import re
+import uuid
 from pathlib import Path
 from dataclasses import dataclass, field
+from typing import Any
 
 from langchain.tools import tool, ToolRuntime
 
+from .auth_crypto.decrypt import (
+    decrypt,
+    decrypt_batch,
+    decrypt_json_file,
+    decrypt_payload,
+    format_batch_output,
+)
 from .skill_loader import SkillLoader
 from .stream import resolve_path
 
@@ -32,6 +43,50 @@ class SkillAgentContext:
     """
     skill_loader: SkillLoader
     working_directory: Path = field(default_factory=Path.cwd)
+    payment_agent: Any | None = None
+    integration_agent: Any | None = None
+    auth_agent: Any | None = None
+    active_thread_id: str = ""
+    loaded_skills_by_thread: dict[str, set[str]] = field(default_factory=dict)
+
+
+def _decode_process_output(data: bytes | None) -> str:
+    """Decode subprocess bytes on Windows where MCP/decrypt output may be UTF-8 or GBK."""
+    if not data:
+        return ""
+    candidates = []
+    for name in ("utf-8", locale.getpreferredencoding(False), "gb18030", "cp936"):
+        if name and name not in candidates:
+            candidates.append(name)
+    for encoding in candidates:
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
+    return env
+
+
+def _split_csv(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _normalize_bash_command(command: str, working_directory: Path) -> str:
+    """Drop redundant `cd access-assistant &&` when already in the project root."""
+    stripped = command.strip()
+    lowered = stripped.lower()
+    prefix = "cd access-assistant &&"
+    if lowered.startswith(prefix):
+        nested = working_directory / "access-assistant"
+        if working_directory.name == "access-assistant" or not nested.is_dir():
+            return stripped[len(prefix) :].strip()
+    return command
 
 
 @tool
@@ -51,23 +106,18 @@ def load_skill(skill_name: str, runtime: ToolRuntime[SkillAgentContext]) -> str:
     """
     loader = runtime.context.skill_loader
 
-    # 尝试加载 skill
     skill_content = loader.load_skill(skill_name)
 
     if not skill_content:
-        # 列出可用的 skills（从已扫描的元数据中获取）
         skills = loader.scan_skills()
         if skills:
             available = [s.name for s in skills]
             return f"Skill '{skill_name}' not found. Available skills: {', '.join(available)}"
-        else:
-            return f"Skill '{skill_name}' not found. No skills are currently available."
+        return f"Skill '{skill_name}' not found. No skills are currently available."
 
-    # 获取 skill 路径信息
     skill_path = skill_content.metadata.skill_path
     scripts_dir = skill_path / "scripts"
 
-    # 构建路径信息
     path_info = f"""
 ## Skill Path Info
 
@@ -80,7 +130,6 @@ uv run {scripts_dir}/script_name.py [args]
 ```
 """
 
-    # 返回 instructions 和路径信息
     return f"""# Skill: {skill_name}
 
 ## Instructions
@@ -88,6 +137,88 @@ uv run {scripts_dir}/script_name.py [args]
 {skill_content.instructions}
 {path_info}
 """
+
+
+@tool
+def delegate_to_payment_agent(task: str, runtime: ToolRuntime[SkillAgentContext]) -> str:
+    """
+    Delegate a payment-related task to the payment sub-agent.
+
+    Use this for:
+    - 订单状态、发货、充值、账号、支付结果等支付问题
+    - payment-assistant skill 相关任务
+
+    Args:
+        task: The payment task to delegate
+    """
+    agent = runtime.context.payment_agent
+    if agent is None:
+        return "[FAILED] Payment sub-agent is not configured."
+
+    try:
+        result = agent.invoke(task, thread_id=f"payment-subagent-{uuid.uuid4()}")
+        response = agent.get_last_response(result).strip()
+        if not response:
+            return "[FAILED] Payment sub-agent returned an empty response."
+        return f"[OK]\n\n{response}"
+    except Exception as e:
+        return f"[FAILED] {str(e)}"
+
+
+@tool
+def delegate_to_integration_agent(task: str, runtime: ToolRuntime[SkillAgentContext]) -> str:
+    """
+    Delegate an integration-related task to the integration sub-agent.
+
+    Use this for:
+    - 商户未授权、授权失败、签名错误、创建 CGW 工单（integration-support-assistant skill 范围）
+    - integration-support-assistant skill 相关任务
+
+    Do NOT use for:
+    - 账号登录、账号信息/操作记录查询（auth sub-agent）
+    - 回调、网关、联调、通用接口报错
+
+    Args:
+        task: The integration task to delegate
+    """
+    agent = runtime.context.integration_agent
+    if agent is None:
+        return "[FAILED] Integration sub-agent is not configured."
+
+    try:
+        result = agent.invoke(task, thread_id=f"integration-subagent-{uuid.uuid4()}")
+        response = agent.get_last_response(result).strip()
+        if not response:
+            return "[FAILED] Integration sub-agent returned an empty response."
+        return f"[OK]\n\n{response}"
+    except Exception as e:
+        return f"[FAILED] {str(e)}"
+
+
+@tool
+def delegate_to_auth_agent(task: str, runtime: ToolRuntime[SkillAgentContext]) -> str:
+    """
+    Delegate an auth-related task to the auth sub-agent.
+
+    Use this for:
+    - 账号登录失败、账号状态查询、账号操作记录查询
+    - auth 子 skill 相关任务（auth-login-failure 等）
+
+    Args:
+        task: The auth task to delegate
+    """
+    agent = runtime.context.auth_agent
+    if agent is None:
+        return "[FAILED] Auth sub-agent is not configured."
+
+    try:
+        result = agent.invoke(task, thread_id=f"auth-subagent-{uuid.uuid4()}")
+        response = agent.get_last_response(result).strip()
+        if not response:
+            return "[FAILED] Auth sub-agent returned an empty response."
+        return f"[OK]\n\n{response}"
+    except Exception as e:
+        return f"[FAILED] {str(e)}"
 
 
 @tool
@@ -115,6 +246,7 @@ def bash(command: str, runtime: ToolRuntime[SkillAgentContext]) -> str:
         command: The shell command to execute
     """
     cwd = str(runtime.context.working_directory)
+    command = _normalize_bash_command(command, runtime.context.working_directory)
 
     try:
         result = subprocess.run(
@@ -122,36 +254,39 @@ def bash(command: str, runtime: ToolRuntime[SkillAgentContext]) -> str:
             shell=True,
             cwd=cwd,
             capture_output=True,
-            text=True,
-            timeout=300,  # 5 分钟超时
+            timeout=300,
+            env=_subprocess_env(),
         )
+        stdout = _decode_process_output(result.stdout)
+        stderr = _decode_process_output(result.stderr)
 
         parts = []
 
-        # 状态标记（与 ToolResultFormatter 配合）
         if result.returncode == 0:
             parts.append("[OK]")
         else:
             parts.append(f"[FAILED] Exit code: {result.returncode}")
 
-        parts.append("")  # 空行分隔
+        parts.append("")
 
-        if result.stdout:
-            parts.append(result.stdout.rstrip())
+        if stdout:
+            parts.append(stdout.rstrip())
 
-        if result.stderr:
-            if result.stdout:
+        if stderr:
+            if stdout:
                 parts.append("")
             parts.append("--- stderr ---")
-            parts.append(result.stderr.rstrip())
+            parts.append(stderr.rstrip())
 
-        if not result.stdout and not result.stderr:
+        if not stdout and not stderr:
             parts.append("(no output)")
 
         return "\n".join(parts)
 
     except subprocess.TimeoutExpired:
         return "[FAILED] Command timed out after 300 seconds."
+    except UnicodeDecodeError as exc:
+        return f"[FAILED] Could not decode command output: {exc}"
     except Exception as e:
         return f"[FAILED] {str(e)}"
 
@@ -214,14 +349,108 @@ def write_file(file_path: str, content: str, runtime: ToolRuntime[SkillAgentCont
     path = resolve_path(file_path, runtime.context.working_directory)
 
     try:
-        # 确保父目录存在
         path.parent.mkdir(parents=True, exist_ok=True)
-
         path.write_text(content, encoding="utf-8")
         return f"[Success] File written: {path}"
 
     except Exception as e:
         return f"[Error] Failed to write file: {str(e)}"
+
+
+@tool
+def decrypt_mcp_result(
+    runtime: ToolRuntime[SkillAgentContext],
+    *,
+    cipher: str = "",
+    json_payload: str = "",
+    json_file: str = "",
+    json_files: str = "",
+    labels: str = "",
+    json_field: str = "result",
+) -> str:
+    """
+    Decrypt auth-mcp-server MCP tool results (AES + GZIP).
+
+    Use this tool after MCP calls that return encrypted payloads. Do NOT use
+    bash, bare python, or Crypto/pycryptodome scripts to decrypt.
+
+    Provide exactly one input mode per call:
+    - json_payload: one MCP JSON response (preferred; decrypt as each MCP returns)
+    - cipher: raw Base64 cipher string (when MCP returns plain cipher only)
+    - json_file: path to a saved MCP JSON file (not used by auth agent)
+    - json_files: comma-separated JSON file paths for batch decrypt (not used by auth agent)
+    - labels: optional comma-separated labels for json_files (same order; default = file stem)
+
+    Args:
+        cipher: Base64 cipher text from MCP result field
+        json_payload: MCP response JSON string containing encrypted result
+        json_file: Single JSON file path relative to working directory
+        json_files: Comma-separated JSON file paths for batch decrypt
+        labels: Comma-separated labels matching json_files order
+        json_field: JSON field holding cipher text (default: result)
+    """
+    cwd = runtime.context.working_directory
+    modes = sum(
+        1
+        for value in (cipher.strip(), json_payload.strip(), json_file.strip(), json_files.strip())
+        if value
+    )
+    if modes == 0:
+        return (
+            "[FAILED] Provide one of: cipher, json_payload, json_file, or json_files. "
+            "Do not use bash/python to decrypt."
+        )
+    if modes > 1:
+        return "[FAILED] Provide only one decrypt input mode at a time."
+
+    try:
+        if json_files.strip():
+            file_paths = _split_csv(json_files)
+            if not file_paths:
+                return "[FAILED] json_files is empty."
+
+            label_list = _split_csv(labels)
+            if label_list and len(label_list) != len(file_paths):
+                return "[FAILED] labels count must match json_files count."
+
+            items: list[tuple[str, str]] = []
+            for index, relative_path in enumerate(file_paths):
+                path = resolve_path(relative_path, cwd)
+                if not path.is_file():
+                    return f"[FAILED] File not found: {relative_path}"
+                label = label_list[index] if label_list else path.stem
+                items.append((label, str(path)))
+
+            batch_results = decrypt_batch(items, json_field=json_field)
+            output = format_batch_output(batch_results)
+            if any(error for _, _, error in batch_results):
+                return f"[FAILED]\n\n{output}"
+            return f"[OK]\n\n{output}"
+
+        if json_file.strip():
+            path = resolve_path(json_file.strip(), cwd)
+            if not path.is_file():
+                return f"[FAILED] File not found: {json_file}"
+            plain_text = decrypt_json_file(path, json_field=json_field)
+            if not plain_text:
+                return "[FAILED] decrypt failed"
+            return f"[OK]\n\n{plain_text}"
+
+        if json_payload.strip():
+            plain_text = decrypt_payload(json_payload.strip(), json_field)
+            if not plain_text:
+                return "[FAILED] decrypt failed"
+            return f"[OK]\n\n{plain_text}"
+
+        plain_text = decrypt(cipher.strip())
+        if not plain_text:
+            return "[FAILED] decrypt failed"
+        return f"[OK]\n\n{plain_text}"
+
+    except ValueError as exc:
+        return f"[FAILED] {exc}"
+    except Exception as exc:
+        return f"[FAILED] {str(exc)}"
 
 
 @tool
@@ -454,3 +683,10 @@ def list_dir(path: str, runtime: ToolRuntime[SkillAgentContext]) -> str:
 
 
 ALL_TOOLS = [load_skill, bash, read_file, write_file, glob, grep, edit, list_dir]
+# Auth agent: skill loading and native decrypt only.
+AUTH_AGENT_TOOLS = [load_skill, decrypt_mcp_result]
+SUPERVISOR_TOOLS = [
+    delegate_to_payment_agent,
+    delegate_to_integration_agent,
+    delegate_to_auth_agent,
+]

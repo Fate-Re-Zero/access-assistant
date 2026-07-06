@@ -1,12 +1,22 @@
 from .agent import AccessAssistantAgent, create_access_assistant_agent
+from .multi_agent import SupervisorSkillsAgent
 from .skill_loader import SkillLoader, SkillMetadata, SkillContent, discover_skills, get_skill_content
-from .tools import load_skill, bash, read_file, write_file, ALL_TOOLS, SkillAgentContext
+from .tools import (
+    load_skill,
+    bash,
+    read_file,
+    write_file,
+    ALL_TOOLS,
+    SUPERVISOR_TOOLS,
+    SkillAgentContext,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
     # Agent
     "AccessAssistantAgent",
+    "SupervisorSkillsAgent",
     "create_access_assistant_agent",
     # Skill Loader
     "SkillLoader",
@@ -20,6 +30,7 @@ __all__ = [
     "read_file",
     "write_file",
     "ALL_TOOLS",
+    "SUPERVISOR_TOOLS",
     # Context
     "SkillAgentContext",
 ]

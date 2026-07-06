@@ -1,6 +1,6 @@
-# Access Assistant Web UI
+# Access-assistant Agent Web UI
 
-React + TypeScript chat UI for the Access Assistant Agent.
+React + TypeScript chat UI for the LangChain Skills Agent.
 
 ## Development
 
@@ -11,7 +11,7 @@ npm run dev
 
 By default the frontend calls `http://localhost:8000`.
 
-To override:
+To override (e.g. local backend):
 
 ```bash
 VITE_API_BASE_URL=http://127.0.0.1:8000 npm run dev

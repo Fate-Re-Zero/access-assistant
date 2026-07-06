@@ -1,5 +1,6 @@
 import { memo } from "react";
 
+import { formatToolArgs } from "../lib/formatToolArgs";
 import type { ToolCallView } from "../state/chatReducer";
 
 const MAX_VISIBLE_LINES = 12;
@@ -10,8 +11,22 @@ type ToolCallItemProps = {
   onToggleExpand: (assistantId: string, toolId: string) => void;
 };
 
+function formatMcpToolLabel(name: string): string | null {
+  if (!name.includes("mcp-server") && !name.includes("-mcp-")) {
+    return null;
+  }
+  const segments = name.split("_");
+  const action = segments[segments.length - 1] || name;
+  const server = segments[0]?.replace(/-mcp-server$/, "") || "mcp";
+  return `MCP ${server}: ${action}`;
+}
+
 function formatToolCompact(tool: ToolCallView): string {
   const args = tool.args ?? {};
+  const mcpLabel = formatMcpToolLabel(tool.name);
+  if (mcpLabel) {
+    return mcpLabel;
+  }
 
   if (tool.name === "load_skill") {
     const skillName = args["skill_name"];
@@ -38,9 +53,7 @@ function formatToolCompact(tool: ToolCallView): string {
     }
   }
 
-  const summarizedArgs = Object.entries(args)
-    .map(([key, value]) => `${key}=${String(value)}`)
-    .join(", ");
+  const summarizedArgs = formatToolArgs(args);
 
   return summarizedArgs ? `${tool.name}(${summarizedArgs})` : `${tool.name}()`;
 }

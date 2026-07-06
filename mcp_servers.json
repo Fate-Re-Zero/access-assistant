@@ -1,0 +1,19 @@
+{
+  "payment-mcp-server": {
+    "url": "http://paymentagent.sdo.com/sse",
+    "transport": "sse"
+  },
+  "auth-mcp-server": {
+    "url": "http://101.227.1.27:6711/auth/sse",
+    "transport": "sse"
+  },
+  "hps-mcp-server": {
+    "url": "http://118.195.220.11:8281/mcp",
+    "transport": "streamable_http"
+  },
+  "agents" : {
+    "payment" : [ "payment-mcp-server" ],
+    "integration" : [ "hps-mcp-server" ],
+    "auth" : [ "auth-mcp-server" ]
+  }
+}

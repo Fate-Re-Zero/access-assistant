@@ -11,13 +11,20 @@ Access Assistant CLI
 - 💬 Response 面板：逐字显示最终响应（绿色）
 """
 
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
+
+from .logging_config import configure_logging
+
+configure_logging(force=True)
+
 import argparse
 import json
 import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -47,9 +54,6 @@ from .stream import (
     is_success,
 )
 
-
-# 加载环境变量（override=True 确保 .env 文件覆盖系统环境变量）
-load_dotenv(override=True)
 
 # Rich Console 配置：支持 Windows 和 NO_COLOR 环境变量
 console = Console(

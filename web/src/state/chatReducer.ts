@@ -1,5 +1,8 @@
 import type {
   AgentStreamEvent,
+  AgentCallEvent,
+  AgentDoneEvent,
+  AgentErrorEvent,
   DoneEvent,
   ErrorEvent,
   ThinkingEvent,
@@ -17,11 +20,24 @@ export type RunPhase =
   | "error";
 
 export type ToolStatus = "running" | "success" | "failed";
+export type SubAgentStatus = "running" | "success" | "failed";
+
+export type SkillMcpSummary = {
+  name: string;
+  transport?: string;
+  url?: string;
+  tool_count?: number;
+  tools?: string[];
+  error?: string | null;
+};
 
 export type SkillSummary = {
   name: string;
   description: string;
   path: string;
+  agent?: string;
+  mcp_servers?: string[];
+  mcps?: SkillMcpSummary[];
 };
 
 export type ToolCallView = {
@@ -33,6 +49,17 @@ export type ToolCallView = {
   success?: boolean;
   expanded?: boolean;
   skillName?: string;
+};
+
+export type SubAgentRunView = {
+  id: string;
+  agentName: string;
+  title: string;
+  status: SubAgentStatus;
+  thinking: string;
+  response: string;
+  tools: ToolCallView[];
+  error?: string;
 };
 
 export type UserEntry = {
@@ -50,6 +77,7 @@ export type AssistantEntry = {
   thinking: string;
   response: string;
   tools: ToolCallView[];
+  subAgents: SubAgentRunView[];
   error?: string;
 };
 
@@ -66,6 +94,7 @@ export type TimelineEntry = UserEntry | AssistantEntry | SystemEntry;
 export type ThreadState = {
   id: string;
   label: string;
+  createdAt: number;
   timeline: TimelineEntry[];
   activeAssistantEntryId?: string;
   activeSkillName?: string;
@@ -87,7 +116,7 @@ export type ChatAction =
   | { type: "skills_loaded"; skills: SkillSummary[] }
   | { type: "skills_failed"; message: string }
   | { type: "prompt_loaded"; prompt: string }
-  | { type: "create_thread"; threadId: string; label: string }
+  | { type: "create_thread"; threadId: string; label: string; createdAt?: number }
   | { type: "switch_thread"; threadId: string }
   | {
       type: "submit_user_message";
@@ -133,7 +162,8 @@ export function createInitialState(): ChatState {
     threads: {
       [DEFAULT_THREAD_ID]: {
         id: DEFAULT_THREAD_ID,
-        label: "Thread 1",
+        label: "新对话",
+        createdAt: Date.now(),
         timeline: [],
       },
     },
@@ -228,16 +258,110 @@ function upsertToolCall(
   return { tools: [...tools, nextTool], skillName };
 }
 
+function ensureSubAgentRunById(
+  subAgents: SubAgentRunView[],
+  runId: string | undefined,
+  fallback: { agentName?: string; title?: string },
+): SubAgentRunView[] {
+  if (!runId) {
+    return subAgents;
+  }
+  if (subAgents.some((run) => run.id === runId)) {
+    return subAgents;
+  }
+
+  const agentName = fallback.agentName?.trim() || "unknown";
+  return [
+    ...subAgents,
+    {
+      id: runId,
+      agentName,
+      title: fallback.title?.trim() || `${agentName} agent`,
+      status: "running",
+      thinking: "",
+      response: "",
+      tools: [],
+    },
+  ];
+}
+
+function ensureSubAgentRun(
+  subAgents: SubAgentRunView[],
+  event: AgentCallEvent,
+): SubAgentRunView[] {
+  const existingIndex = subAgents.findIndex((item) => item.id === event.id);
+  const nextRun: SubAgentRunView = {
+    id: event.id,
+    agentName: event.agent_name,
+    title: event.title || `${event.agent_name} agent`,
+    status: "running",
+    thinking: "",
+    response: "",
+    tools: [],
+  };
+
+  if (existingIndex >= 0) {
+    const cloned = [...subAgents];
+    const previous = cloned[existingIndex];
+    cloned[existingIndex] = {
+      ...previous,
+      agentName: event.agent_name || previous.agentName,
+      title: event.title || previous.title,
+      status: "running",
+      tools: previous.tools,
+      thinking: previous.thinking,
+      response: previous.response,
+      error: undefined,
+    };
+    return cloned;
+  }
+
+  return [...subAgents, nextRun];
+}
+
+function updateSubAgentRun(
+  subAgents: SubAgentRunView[],
+  runId: string | undefined,
+  updater: (run: SubAgentRunView) => SubAgentRunView,
+  fallback?: { agentName?: string; title?: string },
+): SubAgentRunView[] {
+  if (!runId) {
+    return subAgents;
+  }
+
+  const ensured = ensureSubAgentRunById(subAgents, runId, fallback ?? {});
+  return ensured.map((run) => (run.id === runId ? updater(run) : run));
+}
+
+function subAgentFallbackFromEvent(event: {
+  agent?: string;
+  agent_name?: string;
+  task_title?: string;
+}): { agentName?: string; title?: string } {
+  return {
+    agentName: event.agent_name || event.agent,
+    title: event.task_title,
+  };
+}
+
 function applyToolResult(
   tools: ToolCallView[],
   event: ToolResultEvent,
+  toolIdPrefix?: string,
 ): ToolCallView[] {
   const success = inferToolSuccess(event.content, event.success);
   const nextStatus: ToolStatus = success ? "success" : "failed";
+  const prefixedId = event.id && toolIdPrefix ? `${toolIdPrefix}:${event.id}` : event.id;
 
-  let index = tools.findIndex(
-    (tool) => tool.status === "running" && tool.name === event.name,
-  );
+  let index = -1;
+  if (prefixedId) {
+    index = tools.findIndex((tool) => tool.id === prefixedId);
+  }
+  if (index < 0) {
+    index = tools.findIndex(
+      (tool) => tool.status === "running" && tool.name === event.name,
+    );
+  }
 
   if (index < 0) {
     index = tools.findIndex((tool) => tool.status === "running");
@@ -273,6 +397,22 @@ function applyThinkingEvent(
   assistant: AssistantEntry,
   event: ThinkingEvent,
 ): AssistantEntry {
+  if (event.agent && event.agent !== "supervisor") {
+    return {
+      ...assistant,
+      phase: "analyzing",
+      subAgents: updateSubAgentRun(
+        assistant.subAgents,
+        event.agent_run_id,
+        (run) => ({
+          ...run,
+          thinking: run.thinking + event.content,
+        }),
+        subAgentFallbackFromEvent(event),
+      ),
+    };
+  }
+
   return {
     ...assistant,
     phase: "thinking",
@@ -284,6 +424,22 @@ function applyTextEvent(
   assistant: AssistantEntry,
   event: TextEvent,
 ): AssistantEntry {
+  if (event.agent && event.agent !== "supervisor") {
+    return {
+      ...assistant,
+      phase: "analyzing",
+      subAgents: updateSubAgentRun(
+        assistant.subAgents,
+        event.agent_run_id,
+        (run) => ({
+          ...run,
+          response: run.response + event.content,
+        }),
+        subAgentFallbackFromEvent(event),
+      ),
+    };
+  }
+
   return {
     ...assistant,
     phase: "responding",
@@ -302,6 +458,21 @@ function applyDoneEvent(
   };
 }
 
+function applyAgentDoneEvent(
+  assistant: AssistantEntry,
+  event: AgentDoneEvent,
+): AssistantEntry {
+  return {
+    ...assistant,
+    phase: "analyzing",
+    subAgents: updateSubAgentRun(assistant.subAgents, event.id, (run) => ({
+      ...run,
+      status: event.success === false ? "failed" : "success",
+      response: run.response || event.response || "",
+    })),
+  };
+}
+
 function applyErrorEvent(
   assistant: AssistantEntry,
   event: ErrorEvent,
@@ -310,6 +481,21 @@ function applyErrorEvent(
     ...assistant,
     phase: "error",
     error: event.message,
+  };
+}
+
+function applyAgentErrorEvent(
+  assistant: AssistantEntry,
+  event: AgentErrorEvent,
+): AssistantEntry {
+  return {
+    ...assistant,
+    phase: "analyzing",
+    subAgents: updateSubAgentRun(assistant.subAgents, event.id, (run) => ({
+      ...run,
+      status: "failed",
+      error: event.message,
+    })),
   };
 }
 
@@ -351,6 +537,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           [action.threadId]: {
             id: action.threadId,
             label: action.label,
+            createdAt: action.createdAt ?? Date.now(),
             timeline: [],
           },
         },
@@ -393,6 +580,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
             thinking: "",
             response: "",
             tools: [],
+            subAgents: [],
           },
         ],
       };
@@ -443,6 +631,29 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
             return applyTextEvent(assistant, event);
 
           case "tool_call": {
+            if (event.agent && event.agent !== "supervisor") {
+              const fallback = subAgentFallbackFromEvent(event);
+              return {
+                ...assistant,
+                phase: "analyzing",
+                subAgents: updateSubAgentRun(
+                  assistant.subAgents,
+                  event.agent_run_id,
+                  (run) => {
+                    const { tools } = upsertToolCall(run.tools, {
+                      ...event,
+                      id: event.id ? `${event.agent_run_id}:${event.id}` : event.id,
+                    });
+                    return {
+                      ...run,
+                      tools,
+                    };
+                  },
+                  fallback,
+                ),
+              };
+            }
+
             const { tools } = upsertToolCall(assistant.tools, event);
             return {
               ...assistant,
@@ -451,11 +662,40 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           }
 
           case "tool_result":
+            if (event.agent && event.agent !== "supervisor") {
+              const fallback = subAgentFallbackFromEvent(event);
+              return {
+                ...assistant,
+                phase: "analyzing",
+                subAgents: updateSubAgentRun(
+                  assistant.subAgents,
+                  event.agent_run_id,
+                  (run) => ({
+                    ...run,
+                    tools: applyToolResult(run.tools, event, event.agent_run_id),
+                  }),
+                  fallback,
+                ),
+              };
+            }
             return {
               ...assistant,
               phase: "analyzing",
               tools: applyToolResult(assistant.tools, event),
             };
+
+          case "agent_call":
+            return {
+              ...assistant,
+              phase: "analyzing",
+              subAgents: ensureSubAgentRun(assistant.subAgents, event),
+            };
+
+          case "agent_done":
+            return applyAgentDoneEvent(assistant, event);
+
+          case "agent_error":
+            return applyAgentErrorEvent(assistant, event);
 
           case "done":
             return applyDoneEvent(assistant, event);
@@ -512,6 +752,14 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
               ? { ...tool, expanded: !tool.expanded }
               : tool,
           ),
+          subAgents: assistant.subAgents.map((run) => ({
+            ...run,
+            tools: run.tools.map((tool) =>
+              tool.id === action.toolId
+                ? { ...tool, expanded: !tool.expanded }
+                : tool,
+            ),
+          })),
         }),
       );
 
